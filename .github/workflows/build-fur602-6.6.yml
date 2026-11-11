@@ -1,0 +1,162 @@
+name: Build FUR-602 ImmortalWrt 6.6 mtwifi + UPnP
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+env:
+  REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-6.6
+  SOURCE_BRANCH: openwrt-24.10-6.6
+  CONFIG_FILE: config/fur602-6.6-mtwifi-upnp.config
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    steps:
+      - name: 取出本仓库
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          sudo docker image prune --all --force 2>/dev/null || true
+          df -h /
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison gawk gettext git-core \
+            libncurses-dev libssl-dev zlib1g-dev libelf-dev \
+            python3 python3-dev python3-setuptools python3-pip \
+            unzip zip rsync wget curl subversion file \
+            autoconf automake libtool autopoint pkg-config \
+            ccache device-tree-compiler gperf help2man intltool \
+            gcc-multilib g++-multilib libc6-dev-i386 \
+            p7zip-full squashfs-tools xz-utils zstd \
+            swig texinfo xmlto asciidoc uglifyjs \
+            libgmp-dev libmpc-dev libmpfr-dev perl bzip2 gzip
+          sudo apt-get install -y libncurses5-dev 2>/dev/null || true
+          python3 -V; gcc --version | head -1
+
+      - name: 准备 ccache
+        run: |
+          sudo /usr/bin/ccache -M 5G
+          /usr/bin/ccache -z
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      - name: 恢复 ccache 缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-6.6-${{ hashFiles('config/*.config') }}
+          restore-keys: ccache-6.6-
+
+      - name: 拉取源码与 feeds
+        run: |
+          git clone --depth=1 -b "$SOURCE_BRANCH" "$REPO_URL" openwrt
+          cd openwrt
+          git log -1 --oneline
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 注入 FUR-602 DTS 与设备定义
+        run: |
+          set -e
+          # 本步骤的工作目录是仓库根（checkout 出来的 workspace），
+          # dts/ 与 patches/ 就在当前目录，不要写成 ../dts / ../patches。
+          test -f dts/mt7981b-honor-fur-602.dts
+          test -f patches/apply-device.py
+          cp dts/mt7981b-honor-fur-602.dts openwrt/target/linux/mediatek/dts/
+          python3 patches/apply-device.py openwrt/target/linux/mediatek/image/filogic.mk
+          grep -A7 '^define Device/honor_fur-602' openwrt/target/linux/mediatek/image/filogic.mk
+
+      - name: 写入 .config 并展开默认值
+        run: |
+          cd openwrt
+          cp "../$CONFIG_FILE" .config
+          echo "CONFIG_CCACHE=y" >> .config
+          make defconfig
+          ./scripts/diffconfig.sh > ../effective.config
+          head -50 ../effective.config
+
+      - name: 编译前断言（内核 / 设备 / mtwifi / UPnP / 无代理插件）
+        run: |
+          set -e
+          cd openwrt
+          grep -q 'KERNEL_PATCHVER:=6.6' target/linux/mediatek/Makefile && echo "OK: 内核 6.6"
+          grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_honor_fur-602=y' .config && echo "OK: 设备 honor_fur-602"
+          grep -q '^define Device/honor_fur-602' target/linux/mediatek/image/filogic.mk && echo "OK: 设备定义已注入"
+          test -f target/linux/mediatek/dts/mt7981b-honor-fur-602.dts && echo "OK: DTS 已就位"
+          grep -q '^CONFIG_PACKAGE_kmod-mt_wifi=y' .config && echo "OK: 闭源 mtwifi"
+          if grep -q '^CONFIG_PACKAGE_kmod-mt7915e=y' .config; then echo "FAIL: 混入开源 mt76"; exit 1; fi
+          echo "OK: 未启用开源 mt7915e"
+          grep -q '^CONFIG_PACKAGE_luci-app-upnp=y' .config && echo "OK: luci-app-upnp"
+          grep -q '^CONFIG_PACKAGE_miniupnpd=y' .config && echo "OK: miniupnpd"
+          if grep -qE '^CONFIG_PACKAGE_(luci-app-ssr-plus|luci-app-homeproxy)=y' .config; then echo "FAIL: 混入代理插件"; exit 1; fi
+          echo "OK: 无 SSR-Plus / HomeProxy"
+          grep -A9 '^define Device/honor_fur-602' target/linux/mediatek/image/filogic.mk | grep IMAGE_SIZE
+
+      - name: 下载源码包（dl）
+        run: |
+          cd openwrt
+          make download -j8
+          find dl -size -1024c -exec rm -f {} \; || true
+
+      - name: 编译
+        run: |
+          cd openwrt
+          echo "==> 开始编译 $(date '+%F %T')，$(nproc) 线程"
+          make -j$(nproc) || {
+            echo "==> 并行失败，改单线程定位错误 $(date '+%F %T')"
+            make -j1 V=s
+          }
+          echo "==> 编译完成 $(date '+%F %T')"
+
+      - name: 校验并收集产物
+        run: |
+          set -e
+          mkdir -p artifact
+          BIN=openwrt/bin/targets/mediatek/filogic
+          ls -lh "$BIN" || true
+          for f in "$BIN"/*honor_fur-602*; do
+            if [ -f "$f" ]; then cp -v "$f" artifact/; fi
+          done
+          for f in sha256sums config.buildinfo profiles.json immortalwrt-mediatek-filogic.manifest; do
+            cp -v "$BIN/$f" artifact/ 2>/dev/null || true
+          done
+          cp -v effective.config artifact/ 2>/dev/null || true
+          echo "=== artifact ==="; ls -lh artifact
+          test -n "$(find artifact -name '*factory.bin')"    || { echo "FAIL: 缺少 factory.bin"; exit 1; }
+          test -n "$(find artifact -name '*sysupgrade*')"    || { echo "FAIL: 缺少 sysupgrade"; exit 1; }
+          echo "OK: factory / sysupgrade 均已产出"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: fur602-6.6-mtwifi-upnp-${{ github.run_number }}
+          path: artifact
+          retention-days: 30
+
+      - name: 输出构建摘要
+        run: |
+          {
+            echo "## FUR-602 · ImmortalWrt 6.6 + 闭源 mtwifi + UPnP"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| 源码 | \`padavanonly/immortalwrt-mt798x-6.6@openwrt-24.10-6.6\` |"
+            echo "| 内核 | 6.6 |"
+            echo "| 无线 | MTK 闭源 \`kmod-mt_wifi\` |"
+            echo "| 新增插件 | \`luci-app-upnp\` + \`miniupnpd\` |"
+            echo "| 不含 | SSR-Plus / HomeProxy / ttyd / Samba / 下载类插件 |"
+            echo ""
+            echo "### 产物"
+            echo '```'; ls -1 artifact; echo '```'
+          } >> $GITHUB_STEP_SUMMARY
