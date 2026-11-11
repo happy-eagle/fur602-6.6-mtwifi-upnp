@@ -88,20 +88,43 @@ jobs:
 
       - name: 编译前断言（内核 / 设备 / mtwifi / UPnP / 无代理插件）
         run: |
-          set -e
+          set -euo pipefail
           cd openwrt
-          grep -q 'KERNEL_PATCHVER:=6.6' target/linux/mediatek/Makefile && echo "OK: 内核 6.6"
-          grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_honor_fur-602=y' .config && echo "OK: 设备 honor_fur-602"
-          grep -q '^define Device/honor_fur-602' target/linux/mediatek/image/filogic.mk && echo "OK: 设备定义已注入"
-          test -f target/linux/mediatek/dts/mt7981b-honor-fur-602.dts && echo "OK: DTS 已就位"
-          grep -q '^CONFIG_PACKAGE_kmod-mt_wifi=y' .config && echo "OK: 闭源 mtwifi"
-          if grep -q '^CONFIG_PACKAGE_kmod-mt7915e=y' .config; then echo "FAIL: 混入开源 mt76"; exit 1; fi
-          echo "OK: 未启用开源 mt7915e"
-          grep -q '^CONFIG_PACKAGE_luci-app-upnp=y' .config && echo "OK: luci-app-upnp"
-          grep -q '^CONFIG_PACKAGE_miniupnpd=y' .config && echo "OK: miniupnpd"
-          if grep -qE '^CONFIG_PACKAGE_(luci-app-ssr-plus|luci-app-homeproxy)=y' .config; then echo "FAIL: 混入代理插件"; exit 1; fi
-          echo "OK: 无 SSR-Plus / HomeProxy"
-          grep -A9 '^define Device/honor_fur-602' target/linux/mediatek/image/filogic.mk | grep IMAGE_SIZE
+          MK=target/linux/mediatek/image/filogic.mk
+          # 注意：绝不能写成 `grep -q ... && echo OK`——在 set -e 下，&& 列表中
+          # 前置命令失败不会中断脚本，会静默漏检。必须用显式 if + exit 1。
+          need() {
+            if ! grep -qE -- "$2" "$3"; then
+              echo "::error::FAIL: $1 —— 在 $3 中找不到 /$2/"
+              exit 1
+            fi
+            echo "OK: $1"
+          }
+          forbid() {
+            if grep -qE -- "$2" "$3"; then
+              echo "::error::FAIL: 不应出现 $1"
+              exit 1
+            fi
+            echo "OK: 无 $1"
+          }
+          echo "=== .config 中 UPnP / 无线相关实际符号 ==="
+          grep -nE 'CONFIG_PACKAGE_(miniupnpd|luci-app-upnp|luci-i18n-upnp|kmod-mt_wifi|kmod-mt7915e)' .config || true
+          echo "==========================================="
+          need "内核 6.6"                'KERNEL_PATCHVER:=6.6' target/linux/mediatek/Makefile
+          need "设备 honor_fur-602"      '^CONFIG_TARGET_mediatek_filogic_DEVICE_honor_fur-602=y' .config
+          need "设备定义已注入"          '^define Device/honor_fur-602' "$MK"
+          test -f target/linux/mediatek/dts/mt7981b-honor-fur-602.dts || { echo "::error::DTS 缺失"; exit 1; }
+          echo "OK: DTS 已就位"
+          need "闭源 mtwifi"             '^CONFIG_PACKAGE_kmod-mt_wifi=y' .config
+          forbid "开源 mt7915e"          '^CONFIG_PACKAGE_kmod-mt7915e=y' .config
+          need "luci-app-upnp"           '^CONFIG_PACKAGE_luci-app-upnp=y' .config
+          # 24.10 中 miniupnpd 只是 PROVIDES 虚拟名，真实包是 nftables / iptables 变体
+          need "miniupnpd-nftables"      '^CONFIG_PACKAGE_miniupnpd-nftables=y' .config
+          forbid "miniupnpd-iptables"    '^CONFIG_PACKAGE_miniupnpd-iptables=y' .config
+          forbid "SSR-Plus / HomeProxy"  '^CONFIG_PACKAGE_(luci-app-ssr-plus|luci-app-homeproxy)=y' .config
+          need "IMAGE_SIZE=116736k"      'IMAGE_SIZE := 116736k' "$MK"
+          echo "=== 注入的设备块 ==="
+          sed -n '/^define Device\/honor_fur-602/,/^endef/p' "$MK"
 
       - name: 下载源码包（dl）
         run: |

@@ -20,8 +20,6 @@ BLOCK = '''define Device/honor_fur-602
   DEVICE_DTS := mt7981b-honor-fur-602
   DEVICE_DTS_DIR := ../dts
   SUPPORTED_DEVICES += mediatek,mt7981-spim-snand-rfb
-  # 闭源 mtwifi 配套：kmod-mt_wifi 为主驱动（自带 MT7981 WiFi 固件，安装到 /lib/firmware/）；
-  # 后两个是上游 mt7981 设备统一引用的固件包；conninfra/warp/hnat 为驱动依赖。
   DEVICE_PACKAGES := kmod-mt_wifi kmod-mt7981-firmware mt7981-wo-firmware kmod-conninfra kmod-warp kmod-mediatek_hnat
   UBINIZE_OPTS := -E 5
   BLOCKSIZE := 128k

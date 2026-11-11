@@ -10,8 +10,12 @@
   TurboACC-MTK、EQoS、wrtbwmon 流量统计、dnsmasq-full、luci-ssl、
   luci-theme-bootstrap-mod、中文界面（MTK 插件）、htop/nano/tcpdump/ethtool、
   zram-swap、全套 iptables/nftables 扩展
-- 本次新增：`luci-app-upnp` + `miniupnpd` + `luci-i18n-upnp-zh-cn`
+- 本次新增：`luci-app-upnp` + `miniupnpd-nftables` + `luci-i18n-upnp-zh-cn`
   （另补全 `luci-i18n-base-zh-cn` / `luci-i18n-firewall-zh-cn`）
+  - 24.10 里 `miniupnpd` 只是 `PROVIDES` 虚拟包名，**不能**写成
+    `CONFIG_PACKAGE_miniupnpd=y`（`make defconfig` 会直接丢弃）。真实可选包
+    是 `miniupnpd-nftables`（默认变体，本树 firewall4/nftables 用它）与
+    `miniupnpd-iptables`；`luci-app-upnp` 的 `+miniupnpd` 依赖会自动解析到默认变体。
 - 明确不含：HomeProxy、SSR-Plus、ttyd、Samba / Aria2 / qBittorrent / DDNS /
   MWAN3 / Zerotier；主题沿用 bootstrap-mod
 
@@ -56,8 +60,10 @@ initramfs-kernel.bin / sha256sums / config.buildinfo / manifest。
 ## 四、编译内置断言
 
 编译前强制校验：内核 6.6、设备 honor_fur-602 已启用且设备块存在、DTS 就位、
-`kmod-mt_wifi` 启用且**未**启用开源 mt7915e、`luci-app-upnp` 与 `miniupnpd`
-均已选中、**未**混入 SSR-Plus/HomeProxy。任一不满足立即终止。
+`kmod-mt_wifi` 启用且**未**启用开源 mt7915e、`luci-app-upnp` 与
+`miniupnpd-nftables` 均已选中、**未**选中 `miniupnpd-iptables`、
+**未**混入 SSR-Plus/HomeProxy、`IMAGE_SIZE=116736k`。任一不满足立即终止。
+断言用显式 `if + exit 1`，不用 `grep && echo`（后者在 `set -e` 下失败不会中断）。
 编译后校验 factory / sysupgrade 双产物存在。
 
 ## 五、刷机前提（重要）
