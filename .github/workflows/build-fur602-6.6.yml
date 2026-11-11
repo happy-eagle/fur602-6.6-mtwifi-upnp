@@ -85,8 +85,14 @@ jobs:
           make defconfig
           ./scripts/diffconfig.sh > ../effective.config
           head -50 ../effective.config
+          echo "=== defconfig 之后 SSL 栈全部符号 ==="
+          grep -E '^(CONFIG_PACKAGE_|# CONFIG_PACKAGE_)(libustream|wpad|px5g|luci-ssl|openssl-util|wget)' .config | sort || true
+          echo "=== Kconfig 中 select libustream-mbedtls 的来源（溯源用） ==="
+          grep -n -B6 'select PACKAGE_libustream-mbedtls' tmp/.config-package.in || true
+          echo "=== Kconfig 中 select libustream-openssl 的来源（溯源用） ==="
+          grep -n -B6 'select PACKAGE_libustream-openssl' tmp/.config-package.in || true
 
-      - name: 编译前断言（内核 / 设备 / mtwifi / UPnP / 无代理插件）
+      - name: 编译前断言（内核 / 设备 / mtwifi / UPnP / SSL 栈 / 无代理插件）
         run: |
           set -euo pipefail
           cd openwrt
@@ -122,6 +128,15 @@ jobs:
           need "miniupnpd-nftables"      '^CONFIG_PACKAGE_miniupnpd-nftables=y' .config
           forbid "miniupnpd-iptables"    '^CONFIG_PACKAGE_miniupnpd-iptables=y' .config
           forbid "SSR-Plus / HomeProxy"  '^CONFIG_PACKAGE_(luci-app-ssr-plus|luci-app-homeproxy)=y' .config
+          # SSL 后端只能有一套：Run #2 就是 mbedtls + openssl 两个 variant
+          # 抢 /lib/libustream-ssl.so，在 package/install 阶段 Error 255。
+          echo "=== SSL 栈断言 ==="
+          need "luci-ssl-openssl"        '^CONFIG_PACKAGE_luci-ssl-openssl=y' .config
+          need "libustream-openssl"      '^CONFIG_PACKAGE_libustream-openssl=y' .config
+          forbid "luci-ssl(mbedtls)"     '^CONFIG_PACKAGE_luci-ssl=y' .config
+          forbid "libustream-mbedtls"    '^CONFIG_PACKAGE_libustream-mbedtls=y' .config
+          forbid "px5g-mbedtls"          '^CONFIG_PACKAGE_px5g-mbedtls=y' .config
+          forbid "wpad-mbedtls"          '^CONFIG_PACKAGE_wpad-mbedtls=y' .config
           need "IMAGE_SIZE=116736k"      'IMAGE_SIZE := 116736k' "$MK"
           echo "=== 注入的设备块 ==="
           sed -n '/^define Device\/honor_fur-602/,/^endef/p' "$MK"

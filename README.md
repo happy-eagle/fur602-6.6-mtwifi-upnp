@@ -7,7 +7,7 @@
 ## 一、插件清单（已确认）
 
 - 基准（沿用 6.6 FUR-602 参考配置，共 145 项）：硬件 NAT/WED/BBR/fullcone、
-  TurboACC-MTK、EQoS、wrtbwmon 流量统计、dnsmasq-full、luci-ssl、
+  TurboACC-MTK、EQoS、wrtbwmon 流量统计、dnsmasq-full、luci-ssl-openssl、
   luci-theme-bootstrap-mod、中文界面（MTK 插件）、htop/nano/tcpdump/ethtool、
   zram-swap、全套 iptables/nftables 扩展
 - 本次新增：`luci-app-upnp` + `miniupnpd-nftables` + `luci-i18n-upnp-zh-cn`
@@ -18,6 +18,21 @@
     `miniupnpd-iptables`；`luci-app-upnp` 的 `+miniupnpd` 依赖会自动解析到默认变体。
 - 明确不含：HomeProxy、SSR-Plus、ttyd、Samba / Aria2 / qBittorrent / DDNS /
   MWAN3 / Zerotier；主题沿用 bootstrap-mod
+
+### SSL 后端统一为 OpenSSL（Run #2 失败修复）
+
+`package/libs/ustream-ssl` 的 `libustream-mbedtls` / `libustream-openssl` /
+`libustream-wolfssl` 是**三个独立包**（无 `PROVIDES` 虚拟名），三者都会安装
+同一个 `/lib/libustream-ssl.so`。基准配置里的 `luci-ssl` 会强制拉
+`libustream-mbedtls + px5g-mbedtls`，而 filogic 的 `target.mk` 在
+`DEFAULT_PACKAGES` 里自带 `wpad-openssl`，`wget-ssl` / `openssl-util` 也走
+OpenSSL —— 两套后端同时进 rootfs，opkg 在 `package/install` 阶段报
+`check_data_file_clashes` → `Error 255`。
+
+因此改用 `luci-ssl-openssl`（`+libustream-openssl +openssl-util`），去掉
+`luci-ssl` 与 `wpad-mbedtls`，HTTPS LuCI 功能不变，全镜像只保留一种
+`libustream` 实现。workflow 的编译前断言会逐项 forbid
+`luci-ssl` / `libustream-mbedtls` / `px5g-mbedtls` / `wpad-mbedtls`。
 
 ## 二、目录
 
@@ -62,7 +77,12 @@ initramfs-kernel.bin / sha256sums / config.buildinfo / manifest。
 编译前强制校验：内核 6.6、设备 honor_fur-602 已启用且设备块存在、DTS 就位、
 `kmod-mt_wifi` 启用且**未**启用开源 mt7915e、`luci-app-upnp` 与
 `miniupnpd-nftables` 均已选中、**未**选中 `miniupnpd-iptables`、
-**未**混入 SSR-Plus/HomeProxy、`IMAGE_SIZE=116736k`。任一不满足立即终止。
+**未**混入 SSR-Plus/HomeProxy、SSL 栈只有一套 OpenSSL
+（`luci-ssl-openssl` + `libustream-openssl` 已选中，
+`luci-ssl` / `libustream-mbedtls` / `px5g-mbedtls` / `wpad-mbedtls` 全部禁用）、
+`IMAGE_SIZE=116736k`。任一不满足立即终止。
+`make defconfig` 后还会把全部 SSL 符号和 Kconfig 中的 `select` 来源打印到日志，
+便于万一再次冲突时直接定位。
 断言用显式 `if + exit 1`，不用 `grep && echo`（后者在 `set -e` 下失败不会中断）。
 编译后校验 factory / sysupgrade 双产物存在。
 
