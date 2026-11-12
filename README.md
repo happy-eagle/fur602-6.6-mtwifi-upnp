@@ -70,6 +70,23 @@ feeds 暂未 pin（由 `feeds.conf.default` 动态解析），但编译日志会
 commit 复现。runner 目前仍为 `ubuntu-22.04`；若将来 GitHub 下线该镜像，
 需改 `runs-on` 并重新验证完整编译。
 
+### ccache 缓存（编译提速）
+
+Run #4 日志显示 `Cache not found for input keys: ccache-6.6-*`，post-job 又报
+`Path Validation Error: ~/.ccache 不存在 → no cache is being saved`：缓存从未被
+保存，每次都是冷启动（Run #4 用了 78 分钟，Run #3 为 61 分钟）。原因是
+`sudo ccache -M 5G` 以 root 身份写配置、且 `$HOME/.ccache` 目录从未创建，
+`-z` 清零的也不是目标目录。
+
+修复：`mkdir -p "$HOME/.ccache"` → 本步骤内先 `export CCACHE_DIR` → 去掉 `sudo` →
+再执行 `-M 5G` / `-z`，最后写入 `$GITHUB_ENV`；缓存 key 改为
+`<SOURCE_COMMIT>-<配置 hash>-<run_number>`（每次都能保存新缓存），配三级
+`restore-keys` 按「同 commit+同配置 → 同 commit → 任意」逐级回退复用；编译后
+新增 `ccache -s` 统计步骤（`if: always()`，失败也能看命中率）。
+
+**注意**：Run #1~#4 都没有成功保存过缓存，所以修复后的**第一次编译仍会是全量
+冷启动**，从第二次起才会明显提速。
+
 ## 二、目录
 
 ```
@@ -104,7 +121,7 @@ push-to-github.sh                      # 一键推送（push 后自动开始编�
 
 提示输入密码时，**粘贴 Token 而不是账号密码**（用户名填 GitHub 用户名）。
 推送到 `main` 会**自动触发**工作流（也可在 Actions 里手动 Run workflow）。
-耗时约 3~5 小时，完成后在 Summary → Artifacts 下载
+耗时约 1~1.5 小时（ccache 命中后更短），完成后在 Summary → Artifacts 下载
 `fur602-6.6-mtwifi-upnp-<run#>`，内含 factory.bin / sysupgrade.bin /
 initramfs-kernel.bin / sha256sums / config.buildinfo / feeds.buildinfo /
 version.buildinfo / profiles.json / manifest / effective.config / feeds 快照

@@ -51,16 +51,30 @@ jobs:
 
       - name: 准备 ccache
         run: |
-          sudo /usr/bin/ccache -M 5G
+          set -e
+          # 必须显式创建 CCACHE_DIR：actions/cache 遇到不存在的路径会直接跳过保存
+          # （post-job 报 "Path Validation Error ... no cache is being saved"），
+          # 结果每次都是冷缓存。Run #4 因此比 Run #3 多花约 17 分钟。
+          mkdir -p "$HOME/.ccache"
+          # 本步骤内先导出，让 -M / -z 作用于同一个目录；
+          # 绝不能用 sudo，否则配置会被写到 /root，与 runner 的缓存目录不一致。
+          export CCACHE_DIR="$HOME/.ccache"
+          /usr/bin/ccache -M 5G
           /usr/bin/ccache -z
-          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+          /usr/bin/ccache -s || true
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
 
       - name: 恢复 ccache 缓存
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-6.6-${{ hashFiles('config/*.config') }}
-          restore-keys: ccache-6.6-
+          # 加 run_number 保证每次都能保存一份新缓存（避免 "cache already exists"），
+          # restore-keys 按「同 commit+同配置 → 同 commit → 任意」逐级回退复用。
+          key: ccache-6.6-${{ env.SOURCE_COMMIT }}-${{ hashFiles('config/*.config') }}-${{ github.run_number }}
+          restore-keys: |
+            ccache-6.6-${{ env.SOURCE_COMMIT }}-${{ hashFiles('config/*.config') }}-
+            ccache-6.6-${{ env.SOURCE_COMMIT }}-
+            ccache-6.6-
 
       - name: 拉取源码（固定 commit）与 feeds
         run: |
@@ -231,6 +245,13 @@ jobs:
             make -j1 V=s
           }
           echo "==> 编译完成 $(date '+%F %T')"
+
+      - name: ccache 命中统计（诊断用）
+        if: always()
+        run: |
+          export CCACHE_DIR="$HOME/.ccache"
+          /usr/bin/ccache -s || true
+          echo "CCACHE_DIR=$CCACHE_DIR"
 
       - name: 校验并收集产物
         run: |
