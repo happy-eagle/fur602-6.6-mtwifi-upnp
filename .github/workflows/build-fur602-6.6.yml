@@ -160,7 +160,15 @@ jobs:
           cd openwrt
           cp "../$CONFIG_FILE" .config
           echo "CONFIG_CCACHE=y" >> .config
+          # OpenWrt rules.mk 会无条件 export CCACHE_DIR：
+          #   export CCACHE_DIR:=$(if $(CONFIG_CCACHE_DIR),...,$(TOPDIR)/.ccache)
+          # 即不设置 CONFIG_CCACHE_DIR 时，缓存会写进 openwrt/.ccache，
+          # 并覆盖我们从 GITHUB_ENV 传入的 $HOME/.ccache。这样 actions/cache
+          # 保存的只是一个空目录（Run #5 实测仅 8960 bytes，Hits 0/0）。
+          # 显式对齐两者，缓存内容才会真正被保存、下一次才能命中。
+          echo "CONFIG_CCACHE_DIR=\"$HOME/.ccache\"" >> .config
           make defconfig
+          grep -nE '^CONFIG_CCACHE(_DIR)?=' .config
           ./scripts/diffconfig.sh > ../effective.config
           head -50 ../effective.config
           echo "=== defconfig 之后 SSL 栈全部符号 ==="
@@ -216,6 +224,11 @@ jobs:
           forbid "libustream-mbedtls"    '^CONFIG_PACKAGE_libustream-mbedtls=y' .config
           forbid "px5g-mbedtls"          '^CONFIG_PACKAGE_px5g-mbedtls=y' .config
           forbid "wpad-mbedtls"          '^CONFIG_PACKAGE_wpad-mbedtls=y' .config
+          # ccache：必须让 OpenWrt 把缓存写到 actions/cache 监视的目录，
+          # 否则 rules.mk 会覆盖成 $(TOPDIR)/.ccache，缓存保存了也是空的。
+          echo "=== ccache 断言 ==="
+          need "ccache 已启用"            '^CONFIG_CCACHE=y' .config
+          need "ccache 目录指向缓存路径"  '^CONFIG_CCACHE_DIR="[^"]*/\.ccache"$' .config
           # 主题：该分支不存在 luci-theme-bootstrap-mod，luci-light 硬依赖
           # +luci-theme-bootstrap；这里同时 need 真实包与 forbid 无效包。
           echo "=== 主题 / ttyd 断言 ==="
@@ -250,8 +263,18 @@ jobs:
         if: always()
         run: |
           export CCACHE_DIR="$HOME/.ccache"
-          /usr/bin/ccache -s || true
+          # 优先用 OpenWrt 自己编译的 ccache，避免与系统 ccache 版本不同
+          # 导致读同一缓存目录时统计口径不一致。
+          if [ -x openwrt/staging_dir/host/bin/ccache ]; then
+            echo "=== OpenWrt 自带 ccache 统计 ==="
+            openwrt/staging_dir/host/bin/ccache -s || true
+          else
+            echo "=== 系统 ccache 统计 ==="
+            /usr/bin/ccache -s || true
+          fi
           echo "CCACHE_DIR=$CCACHE_DIR"
+          echo "=== 缓存目录实际大小（为空说明 ccache 没写进来）==="
+          du -sh "$CCACHE_DIR" || true
 
       - name: 校验并收集产物
         run: |

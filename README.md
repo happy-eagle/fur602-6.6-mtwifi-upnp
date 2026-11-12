@@ -72,9 +72,11 @@ commit 复现。runner 目前仍为 `ubuntu-22.04`；若将来 GitHub 下线该�
 
 ### ccache 缓存（编译提速）
 
-Run #4 日志显示 `Cache not found for input keys: ccache-6.6-*`，post-job 又报
-`Path Validation Error: ~/.ccache 不存在 → no cache is being saved`：缓存从未被
-保存，每次都是冷启动（Run #4 用了 78 分钟，Run #3 为 61 分钟）。原因是
+这个问题有两层，Run #4、Run #5 各暴露一层。
+
+**第一层（Run #4）**：日志显示 `Cache not found for input keys: ccache-6.6-*`，
+post-job 又报 `Path Validation Error: ~/.ccache 不存在 → no cache is being saved`：
+缓存从未被保存，每次都是冷启动（Run #4 用了 78 分钟，Run #3 为 61 分钟）。原因是
 `sudo ccache -M 5G` 以 root 身份写配置、且 `$HOME/.ccache` 目录从未创建，
 `-z` 清零的也不是目标目录。
 
@@ -84,8 +86,27 @@ Run #4 日志显示 `Cache not found for input keys: ccache-6.6-*`，post-job �
 `restore-keys` 按「同 commit+同配置 → 同 commit → 任意」逐级回退复用；编译后
 新增 `ccache -s` 统计步骤（`if: always()`，失败也能看命中率）。
 
-**注意**：Run #1~#4 都没有成功保存过缓存，所以修复后的**第一次编译仍会是全量
-冷启动**，从第二次起才会明显提速。
+**第二层（Run #5）**：上述修复后日志确实出现 `Cache saved with key: ...-5`，
+但缓存压缩包只有 8960 bytes，编译后统计仍是 `Hits 0/0`、`Cache size 0.00 GB`。
+根因在 OpenWrt 自己的 `rules.mk`：
+
+```make
+export CCACHE_DIR:=$(if $(call qstrip,$(CONFIG_CCACHE_DIR)),...,$(TOPDIR)/.ccache)
+```
+
+`CONFIG_CCACHE=y` 时 `TARGET_CC` / `HOSTCC` 确实会被 `ccache` 包装，但 `rules.mk`
+无条件 `export CCACHE_DIR`：未设置 `CONFIG_CCACHE_DIR` 就覆盖成 `openwrt/.ccache`，
+并盖掉从 `GITHUB_ENV` 传入的 `$HOME/.ccache`。于是 `actions/cache` 保存的永远是
+空目录，真正的编译缓存随 workspace 一起丢弃，下次仍不会提速。
+
+修复：写 `.config` 时追加 `CONFIG_CCACHE_DIR="$HOME/.ccache"`，让 OpenWrt 把缓存
+写进 `actions/cache` 监视的同一目录；编译前断言新增两条（`CONFIG_CCACHE=y` 与
+`CONFIG_CCACHE_DIR` 指向 `/.ccache`）；统计步骤改用 OpenWrt 自带的
+`staging_dir/host/bin/ccache -s`，并打印 `du -sh` 目录实际大小。
+
+**注意**：修复后第一次编译仍是全量冷启动（负责填缓存），**第二次**起才会出现
+`Cache restored` 与命中率。验收标准是 `du -sh` 非零 + `Hits` 不为 0，
+而不只是看到 "Cache saved"。
 
 ## 二、目录
 
