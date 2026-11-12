@@ -9,6 +9,10 @@ on:
 env:
   REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-6.6
   SOURCE_BRANCH: openwrt-24.10-6.6
+  # 固定到 Run #3（已成功产出可刷 factory.bin）实际使用的上游 HEAD，
+  # 避免分支后续提交导致构建不可复现 / 悄悄换内核或换包。
+  # 如需升级源码，改这里并重新跑一次完整编译验证即可。
+  SOURCE_COMMIT: ec9ef10efc65da1e6d1de4e2c043c0e13d08eed8
   CONFIG_FILE: config/fur602-6.6-mtwifi-upnp.config
   TZ: Asia/Shanghai
 
@@ -58,13 +62,34 @@ jobs:
           key: ccache-6.6-${{ hashFiles('config/*.config') }}
           restore-keys: ccache-6.6-
 
-      - name: 拉取源码与 feeds
+      - name: 拉取源码（固定 commit）与 feeds
         run: |
-          git clone --depth=1 -b "$SOURCE_BRANCH" "$REPO_URL" openwrt
+          set -e
+          echo "==> 目标源码 commit: $SOURCE_COMMIT"
+          # 按 SHA 浅拉取，而不是 clone 分支 HEAD：分支会移动，构建不可复现。
+          git init -q openwrt
           cd openwrt
-          git log -1 --oneline
+          git remote add origin "$REPO_URL"
+          if git fetch --depth=1 origin "$SOURCE_COMMIT"; then
+            git checkout -q --detach FETCH_HEAD
+          else
+            echo "::warning::按 SHA 拉取失败，回退到分支 $SOURCE_BRANCH 最新提交（本次不可复现）"
+            git fetch --depth=1 origin "$SOURCE_BRANCH"
+            git checkout -q --detach FETCH_HEAD
+          fi
+          git log -1 --format='源码 HEAD : %H%n提交日期 : %cI%n提交标题 : %s'
+          if [ "$(git rev-parse HEAD)" != "$SOURCE_COMMIT" ]; then
+            echo "::warning::实际 HEAD 与固定 commit 不一致，本次构建不可复现"
+          fi
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+          echo "=== feeds commit 快照（用于事后复现）==="
+          for d in feeds/*/; do
+            if [ -d "$d/.git" ]; then
+              printf '%-28s %s\n' "$d" "$(git -C "$d" rev-parse HEAD)"
+            fi
+          done
+          cp -v feeds.conf.default ../feeds.conf.snapshot 2>/dev/null || true
 
       - name: 注入 FUR-602 DTS 与设备定义
         run: |
@@ -76,6 +101,45 @@ jobs:
           cp dts/mt7981b-honor-fur-602.dts openwrt/target/linux/mediatek/dts/
           python3 patches/apply-device.py openwrt/target/linux/mediatek/image/filogic.mk
           grep -A7 '^define Device/honor_fur-602' openwrt/target/linux/mediatek/image/filogic.mk
+
+      - name: 种子配置静态检查（无效符号 / 自相矛盾 / 残留插件）
+        run: |
+          set -euo pipefail
+          CFG="$CONFIG_FILE"
+          test -s "$CFG" || { echo "::error::种子配置为空或缺失: $CFG"; exit 1; }
+          forbid() {
+            if grep -qE -- "$2" "$CFG"; then
+              echo "::error::种子配置出现无效/冲突符号: $1 (/$2/)"
+              exit 1
+            fi
+            echo "OK: 无 $1"
+          }
+          forbid "5.4 树残留子目标"        '^CONFIG_TARGET_mediatek_mt7981=y'
+          forbid "无效主题 bootstrap-mod"   'luci-theme-bootstrap-mod=y'
+          forbid "无效包 kmod-nft-fullcone" '^CONFIG_PACKAGE_kmod-nft-fullcone=y'
+          forbid "无效包 tc-mod-iptables"   '^CONFIG_PACKAGE_tc-mod-iptables=y'
+          forbid "虚拟包名 miniupnpd"       '^CONFIG_PACKAGE_miniupnpd=y'
+          forbid "多 profile 残留"          '^CONFIG_TARGET_(MULTI_PROFILE|PER_DEVICE_ROOTFS)=y'
+          forbid "空设备包列表"             '^CONFIG_TARGET_DEVICE_PACKAGES_'
+          forbid "BAND_STEERING 重复开启"   '^CONFIG_MTK_BAND_STEERING=y'
+          forbid "代理插件残留"             '^# CONFIG_PACKAGE_(luci-app-passwall|luci-app-vssr|luci-app-rclone)_'
+          # 通用检查：同一个符号不能既 =y 又 "is not set"（BAND_STEERING 曾踩过）
+          python3 -c "
+          import re, sys
+          yes, no = set(), set()
+          for line in open(sys.argv[1], encoding='utf-8'):
+              line = line.strip()
+              m = re.match(r'^(CONFIG_[A-Za-z0-9_]+)=', line)
+              if m: yes.add(m.group(1)); continue
+              m = re.match(r'^# (CONFIG_[A-Za-z0-9_]+) is not set\$', line)
+              if m: no.add(m.group(1))
+          dup = sorted(yes & no)
+          if dup:
+              print('::error::种子配置存在自相矛盾符号: ' + ', '.join(dup))
+              sys.exit(1)
+          print('OK: 无 =y / is not set 自相矛盾符号')
+          " "$CFG"
+          echo "种子配置行数: $(wc -l < "$CFG")，CONFIG_PACKAGE_ 行数: $(grep -cE '^CONFIG_PACKAGE_' "$CFG")"
 
       - name: 写入 .config 并展开默认值
         run: |
@@ -133,10 +197,21 @@ jobs:
           echo "=== SSL 栈断言 ==="
           need "luci-ssl-openssl"        '^CONFIG_PACKAGE_luci-ssl-openssl=y' .config
           need "libustream-openssl"      '^CONFIG_PACKAGE_libustream-openssl=y' .config
+          need "wpad-openssl"            '^CONFIG_PACKAGE_wpad-openssl=y' .config
           forbid "luci-ssl(mbedtls)"     '^CONFIG_PACKAGE_luci-ssl=y' .config
           forbid "libustream-mbedtls"    '^CONFIG_PACKAGE_libustream-mbedtls=y' .config
           forbid "px5g-mbedtls"          '^CONFIG_PACKAGE_px5g-mbedtls=y' .config
           forbid "wpad-mbedtls"          '^CONFIG_PACKAGE_wpad-mbedtls=y' .config
+          # 主题：该分支不存在 luci-theme-bootstrap-mod，luci-light 硬依赖
+          # +luci-theme-bootstrap；这里同时 need 真实包与 forbid 无效包。
+          echo "=== 主题 / ttyd 断言 ==="
+          need "luci-theme-bootstrap"    '^CONFIG_PACKAGE_luci-theme-bootstrap=y' .config
+          forbid "无效主题 bootstrap-mod" '^CONFIG_PACKAGE_luci-theme-bootstrap-mod' .config
+          forbid "无效包 nft-fullcone"   '^CONFIG_PACKAGE_kmod-nft-fullcone' .config
+          # ttyd 按用户确认保留（上游默认包带入），只打印、不做强断言，
+          # 避免上游默认包调整时把本构建误判为失败。
+          echo "--- ttyd 实际符号（保留即可，不强制）---"
+          grep -E '^CONFIG_PACKAGE_(ttyd|luci-app-ttyd)=' .config || true
           need "IMAGE_SIZE=116736k"      'IMAGE_SIZE := 116736k' "$MK"
           echo "=== 注入的设备块 ==="
           sed -n '/^define Device\/honor_fur-602/,/^endef/p' "$MK"
@@ -163,17 +238,24 @@ jobs:
           mkdir -p artifact
           BIN=openwrt/bin/targets/mediatek/filogic
           ls -lh "$BIN" || true
-          for f in "$BIN"/*honor_fur-602*; do
-            if [ -f "$f" ]; then cp -v "$f" artifact/; fi
-          done
-          for f in sha256sums config.buildinfo profiles.json immortalwrt-mediatek-filogic.manifest; do
-            cp -v "$BIN/$f" artifact/ 2>/dev/null || true
+          # 按 sha256sums 里出现的文件名全量收集；此前只挑 *honor_fur-602*
+          # 会漏 feeds.buildinfo / version.buildinfo 和 5 个 mt79xx bl2 bin，
+          # 导致下载后 sha256sum -c 出现 MISSING 条目。
+          for f in "$BIN"/*; do
+            [ -f "$f" ] || continue
+            case "$(basename "$f")" in
+              *honor_fur-602*|sha256sums|config.buildinfo|feeds.buildinfo|version.buildinfo|profiles.json|*.manifest|*bl2.bin)
+                cp -v "$f" artifact/ ;;
+            esac
           done
           cp -v effective.config artifact/ 2>/dev/null || true
+          cp -v feeds.conf.snapshot artifact/ 2>/dev/null || true
           echo "=== artifact ==="; ls -lh artifact
-          test -n "$(find artifact -name '*factory.bin')"    || { echo "FAIL: 缺少 factory.bin"; exit 1; }
-          test -n "$(find artifact -name '*sysupgrade*')"    || { echo "FAIL: 缺少 sysupgrade"; exit 1; }
-          echo "OK: factory / sysupgrade 均已产出"
+          test -n "$(find artifact -name '*factory.bin')" || { echo "::error::缺少 factory.bin"; exit 1; }
+          test -n "$(find artifact -name '*sysupgrade*')" || { echo "::error::缺少 sysupgrade"; exit 1; }
+          echo "=== sha256sums 全量校验（含 feeds/version.buildinfo 与 bl2）==="
+          (cd artifact && sha256sum -c sha256sums)
+          echo "OK: factory / sysupgrade 已产出，sha256sums 全部条目齐全且校验通过"
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
@@ -189,11 +271,14 @@ jobs:
             echo ""
             echo "| 项目 | 值 |"
             echo "|---|---|"
-            echo "| 源码 | \`padavanonly/immortalwrt-mt798x-6.6@openwrt-24.10-6.6\` |"
+            echo "| 源码 | \`padavanonly/immortalwrt-mt798x-6.6@$SOURCE_BRANCH\` |"
+            echo "| 固定 commit | \`$SOURCE_COMMIT\` |"
             echo "| 内核 | 6.6 |"
             echo "| 无线 | MTK 闭源 \`kmod-mt_wifi\` |"
-            echo "| 新增插件 | \`luci-app-upnp\` + \`miniupnpd\` |"
-            echo "| 不含 | SSR-Plus / HomeProxy / ttyd / Samba / 下载类插件 |"
+            echo "| 新增插件 | \`luci-app-upnp\` + \`miniupnpd-nftables\` + 中文包 |"
+            echo "| 主题 | \`luci-theme-bootstrap\`（该分支无 bootstrap-mod） |"
+            echo "| 保留 | ttyd（上游默认包带入，用户确认保留） |"
+            echo "| 不含 | SSR-Plus / HomeProxy / PassWall / Samba / 下载类 / DDNS / MWAN3 / Zerotier |"
             echo ""
             echo "### 产物"
             echo '```'; ls -1 artifact; echo '```'
